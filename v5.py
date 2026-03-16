@@ -62,17 +62,56 @@ SELL_SIGNALS = {
 #  INDICATOR FUNCTIONS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def send_telegram_alert(msg: str) -> bool:
+def _tg_escape(text: str) -> str:
+    """Escape special characters for Telegram MarkdownV2."""
+    # Characters that must be escaped in MarkdownV2 plain text
+    specials = r"\_*[]()~`>#+-=|{}.!"
+    for ch in specials:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
+def send_telegram_alert(msg: str) -> tuple:
+    """
+    Send a plain-text message via Telegram Bot API.
+    Returns (success: bool, error_msg: str).
+    Uses POST + plain text (no parse_mode) to avoid escaping issues.
+    """
     if not (BOT_TOKEN and CHAT_ID):
-        return False
+        return False, "Telegram 未設定（請在 secrets.toml 中設定 BOT_TOKEN 和 CHAT_ID）"
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": msg,
-                   "parse_mode": "HTML", "disable_web_page_preview": True}
-        r = requests.get(url, params=payload, timeout=10)
-        return r.status_code == 200 and r.json().get("ok", False)
+        url     = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id":                  CHAT_ID,
+            "text":                     msg,
+            "disable_web_page_preview": True,
+            "disable_notification":     False,
+        }
+        r = requests.post(url, json=payload, timeout=15)
+        resp = r.json()
+        if r.status_code == 200 and resp.get("ok"):
+            return True, ""
+        else:
+            err = resp.get("description", f"HTTP {r.status_code}")
+            return False, f"Telegram API 錯誤：{err}"
+    except requests.exceptions.Timeout:
+        return False, "Telegram 發送逾時（15 秒）"
+    except Exception as e:
+        return False, f"Telegram 發送例外：{e}"
+
+
+def _fmt_vol(vol) -> str:
+    """Format volume as readable string: 1,234,567 → 1.23M"""
+    try:
+        v = float(vol)
+        if v >= 1_000_000:
+            return f"{v/1_000_000:.2f}M"
+        elif v >= 1_000:
+            return f"{v/1_000:.1f}K"
+        else:
+            return f"{v:.0f}"
     except Exception:
-        return False
+        return str(vol)
 
 
 def calculate_macd(df, fast=12, slow=26, signal=9):
@@ -275,47 +314,334 @@ def send_email_alert(ticker: str, price_pct: float, volume_pct: float, active_si
 #  BACKTEST: combination win-rate
 # ═════════════════════════════════════════════════════════════════════════════
 
-def backtest_signal_combinations(df: pd.DataFrame, min_combo=2,
-                                  max_combo=4, min_occ=3) -> pd.DataFrame:
+def _calc_wr(sub: "pd.DataFrame", is_sell: bool) -> float:
+    """Helper: win rate for a subset."""
+    if len(sub) == 0:
+        return 0.0
+    return (1 - sub["_next_up"].mean()) * 100 if is_sell else sub["_next_up"].mean() * 100
+
+
+def _base_signal_combos(df: "pd.DataFrame", min_combo: int, max_combo: int,
+                         min_occ: int) -> "pd.DataFrame":
     """
-    For every combination of signals (size min_combo..max_combo),
-    compute the win-rate = P(next_close > current_close | all signals present).
+    維度 1：純信號組合勝率
+    回傳欄位：信號組合, 信號數量, 勝率(%), 出現次數, 方向
     """
     df = df.copy()
     df["_next_up"] = df["Close"].shift(-1) > df["Close"]
     signal_sets = []
     for marks in df["異動標記"].fillna(""):
-        sigs = {s.strip() for s in str(marks).split(", ") if s.strip() and "🔥" not in s}
+        sigs = {s.strip() for s in str(marks).split(", ")
+                if s.strip() and "🔥" not in s}
         signal_sets.append(sigs)
     df["_sigs"] = signal_sets
-
-    all_s = set()
-    for s in signal_sets:
-        all_s.update(s)
-    all_s = sorted(all_s)
+    all_s = sorted({s for ss in signal_sets for s in ss})
 
     rows = []
     for r in range(min_combo, min(max_combo + 1, len(all_s) + 1)):
         for combo in combinations(all_s, r):
-            cs   = set(combo)
+            cs = set(combo)
             mask = df["_sigs"].apply(lambda s: cs.issubset(s))
             sub  = df[mask]
             if len(sub) < min_occ:
                 continue
-            sell_n = sum(1 for s in combo if s in SELL_SIGNALS)
-            is_sell = sell_n > len(combo) / 2
-            wr = (1 - sub["_next_up"].mean()) * 100 if is_sell else sub["_next_up"].mean() * 100
+            is_sell = sum(1 for s in combo if s in SELL_SIGNALS) > len(combo) / 2
             rows.append({
-                "信號組合":  " + ".join(combo),
-                "信號數量":  r,
-                "勝率(%)":   round(wr, 1),
-                "出現次數":  len(sub),
-                "方向":      "做空" if is_sell else "做多",
+                "維度":     "信號組合",
+                "信號組合": " + ".join(combo),
+                "成交量標記": "—",
+                "K線形態":  "—",
+                "信號數量": r,
+                "勝率(%)":  round(_calc_wr(sub, is_sell), 1),
+                "出現次數": len(sub),
+                "方向":     "做空" if is_sell else "做多",
             })
-
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("勝率(%)", ascending=False).head(30)
+
+
+def _signal_x_volume_combos(df: "pd.DataFrame", min_combo: int, max_combo: int,
+                              min_occ: int) -> "pd.DataFrame":
+    """
+    維度 2：信號組合 × 成交量標記（放量 / 縮量）
+    回傳欄位同上，成交量標記填實際值
+    """
+    if "成交量標記" not in df.columns:
+        return pd.DataFrame()
+    df = df.copy()
+    df["_next_up"] = df["Close"].shift(-1) > df["Close"]
+    signal_sets = []
+    for marks in df["異動標記"].fillna(""):
+        sigs = {s.strip() for s in str(marks).split(", ")
+                if s.strip() and "🔥" not in s}
+        signal_sets.append(sigs)
+    df["_sigs"] = signal_sets
+    all_s = sorted({s for ss in signal_sets for s in ss})
+
+    rows = []
+    for r in range(min_combo, min(max_combo + 1, len(all_s) + 1)):
+        for combo in combinations(all_s, r):
+            cs = set(combo)
+            base_mask = df["_sigs"].apply(lambda s: cs.issubset(s))
+            base_sub  = df[base_mask]
+            if len(base_sub) < min_occ:
+                continue
+            is_sell = sum(1 for s in combo if s in SELL_SIGNALS) > len(combo) / 2
+            for vol_label in ["放量", "縮量"]:
+                sub = base_sub[base_sub["成交量標記"] == vol_label]
+                if len(sub) < min_occ:
+                    continue
+                rows.append({
+                    "維度":     "信號+成交量",
+                    "信號組合": " + ".join(combo),
+                    "成交量標記": vol_label,
+                    "K線形態":  "—",
+                    "信號數量": r,
+                    "勝率(%)":  round(_calc_wr(sub, is_sell), 1),
+                    "出現次數": len(sub),
+                    "方向":     "做空" if is_sell else "做多",
+                })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("勝率(%)", ascending=False).head(30)
+
+
+def _signal_x_kline_combos(df: "pd.DataFrame", min_combo: int, max_combo: int,
+                             min_occ: int) -> "pd.DataFrame":
+    """
+    維度 3：信號組合 × K線形態
+    回傳欄位同上，K線形態填實際值
+    """
+    if "K線形態" not in df.columns:
+        return pd.DataFrame()
+    df = df.copy()
+    df["_next_up"] = df["Close"].shift(-1) > df["Close"]
+    signal_sets = []
+    for marks in df["異動標記"].fillna(""):
+        sigs = {s.strip() for s in str(marks).split(", ")
+                if s.strip() and "🔥" not in s}
+        signal_sets.append(sigs)
+    df["_sigs"] = signal_sets
+    all_s = sorted({s for ss in signal_sets for s in ss})
+    kline_vals = [k for k in df["K線形態"].dropna().unique() if k and k != "普通K線"]
+
+    rows = []
+    for r in range(min_combo, min(max_combo + 1, len(all_s) + 1)):
+        for combo in combinations(all_s, r):
+            cs = set(combo)
+            base_mask = df["_sigs"].apply(lambda s: cs.issubset(s))
+            base_sub  = df[base_mask]
+            if len(base_sub) < min_occ:
+                continue
+            is_sell = sum(1 for s in combo if s in SELL_SIGNALS) > len(combo) / 2
+            for kl in kline_vals:
+                sub = base_sub[base_sub["K線形態"] == kl]
+                if len(sub) < min_occ:
+                    continue
+                rows.append({
+                    "維度":     "信號+K線形態",
+                    "信號組合": " + ".join(combo),
+                    "成交量標記": "—",
+                    "K線形態":  kl,
+                    "信號數量": r,
+                    "勝率(%)":  round(_calc_wr(sub, is_sell), 1),
+                    "出現次數": len(sub),
+                    "方向":     "做空" if is_sell else "做多",
+                })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("勝率(%)", ascending=False).head(30)
+
+
+
+def _detailed_backtest(df: "pd.DataFrame",
+                       signal_combo: str,
+                       vol_filter: str = "—",
+                       kline_filter: str = "—",
+                       direction: str = "做多",
+                       hold_bars: int = 1) -> "pd.DataFrame":
+    """
+    對單一信號組合逐筆展開所有交易記錄，計算每筆盈虧。
+
+    Parameters
+    ----------
+    df            : 已含異動標記、K線形態、成交量標記的完整回測資料
+    signal_combo  : " + " 分隔的信號組合字串
+    vol_filter    : "放量" / "縮量" / "—"（不限）
+    kline_filter  : K線形態字串 / "—"（不限）
+    direction     : "做多" or "做空"
+    hold_bars     : 持倉根數（預設 1 = 下一根出場）
+
+    Returns
+    -------
+    pd.DataFrame：每一筆交易的詳細記錄
+    """
+    if df.empty or "異動標記" not in df.columns:
+        return pd.DataFrame()
+
+    df = df.copy().reset_index(drop=True)
+
+    # 解析組合信號
+    required_sigs = [s.strip() for s in signal_combo.split(" + ") if s.strip()]
+
+    # 篩選命中行
+    def _hit(row):
+        marks = str(row.get("異動標記", ""))
+        sigs  = {s.strip() for s in marks.split(", ") if s.strip()}
+        sig_ok = all(s in sigs for s in required_sigs)
+        vol_ok = (vol_filter in ("—", "全部") or
+                  str(row.get("成交量標記","")) == vol_filter)
+        kl_ok  = (kline_filter in ("—", "全部") or
+                  str(row.get("K線形態","")) == kline_filter)
+        return sig_ok and vol_ok and kl_ok
+
+    hit_mask = df.apply(_hit, axis=1)
+    hit_idx  = df.index[hit_mask].tolist()
+
+    records = []
+    for i in hit_idx:
+        exit_i = i + hold_bars
+        if exit_i >= len(df):
+            continue  # 無出場K線，跳過最後幾筆
+
+        entry_bar  = df.iloc[i]
+        exit_bar   = df.iloc[exit_i]
+
+        # 進場價 = 當根收盤（訊號出現時）
+        # 出場價 = hold_bars 根後的收盤
+        entry_price = float(entry_bar["Close"])
+        exit_price  = float(exit_bar["Close"])
+
+        if entry_price <= 0:
+            continue
+
+        if direction == "做多":
+            pnl_pct  = (exit_price - entry_price) / entry_price * 100
+            win      = exit_price > entry_price
+        else:  # 做空
+            pnl_pct  = (entry_price - exit_price) / entry_price * 100
+            win      = exit_price < entry_price
+
+        # RSI / MACD at entry
+        entry_rsi  = round(float(entry_bar.get("RSI",  float("nan"))), 1)
+        entry_macd = round(float(entry_bar.get("MACD", float("nan"))), 4)
+        entry_vol  = entry_bar.get("成交量標記", "—")
+        entry_kl   = entry_bar.get("K線形態",    "—")
+
+        # High / Low in the holding period for risk metrics
+        hold_slice      = df.iloc[i+1 : exit_i+1]
+        max_high        = float(hold_slice["High"].max()) if not hold_slice.empty else exit_price
+        min_low         = float(hold_slice["Low"].min())  if not hold_slice.empty else exit_price
+
+        if direction == "做多":
+            max_runup_pct  = (max_high - entry_price) / entry_price * 100
+            max_drawdown_pct = (entry_price - min_low) / entry_price * 100
+        else:
+            max_runup_pct  = (entry_price - min_low)  / entry_price * 100
+            max_drawdown_pct = (max_high - entry_price) / entry_price * 100
+
+        entry_dt = entry_bar.get("Datetime", "")
+        exit_dt  = exit_bar.get("Datetime",  "")
+
+        records.append({
+            "序號":        len(records) + 1,
+            "進場時間":    str(entry_dt)[:19],
+            "出場時間":    str(exit_dt)[:19],
+            "持倉根數":    hold_bars,
+            "進場價":      round(entry_price, 4),
+            "出場價":      round(exit_price,  4),
+            "方向":        direction,
+            "盈虧(%)":     round(pnl_pct, 2),
+            "勝負":        "✅ 勝" if win else "❌ 敗",
+            "最大順勢(%)": round(max_runup_pct,   2),
+            "最大逆勢(%)": round(max_drawdown_pct, 2),
+            "進場RSI":     entry_rsi,
+            "進場MACD":    entry_macd,
+            "成交量標記":  str(entry_vol),
+            "K線形態":     str(entry_kl),
+            "觸發信號":    str(entry_bar.get("異動標記", ""))[:120],
+        })
+
+    if not records:
+        return pd.DataFrame()
+
+    detail_df = pd.DataFrame(records)
+
+    # 累計盈虧（等額投入，每次 100%，簡易模擬）
+    detail_df["累計盈虧(%)"] = detail_df["盈虧(%)"].cumsum().round(2)
+
+    # 連勝 / 連敗統計
+    wins = (detail_df["勝負"] == "✅ 勝").astype(int)
+    loss = (1 - wins)
+    streak_win = wins  * (wins .groupby((wins  == 0).cumsum()).cumcount() + 1)
+    streak_loss= loss  * (loss.groupby((loss == 0).cumsum()).cumcount() + 1)
+    detail_df["連勝數"] = streak_win
+    detail_df["連敗數"] = streak_loss
+
+    return detail_df
+
+
+def _summary_stats(detail_df: "pd.DataFrame") -> dict:
+    """
+    從逐筆交易記錄計算統計摘要，用於驗證勝率準確度。
+    """
+    if detail_df.empty:
+        return {}
+
+    total    = len(detail_df)
+    wins     = (detail_df["勝負"] == "✅ 勝").sum()
+    losses   = total - wins
+    wr       = wins / total * 100 if total else 0
+
+    pnl      = detail_df["盈虧(%)"]
+    win_pnl  = pnl[detail_df["勝負"] == "✅ 勝"]
+    loss_pnl = pnl[detail_df["勝負"] == "❌ 敗"]
+
+    avg_win  = win_pnl.mean()  if len(win_pnl)  else 0
+    avg_loss = loss_pnl.mean() if len(loss_pnl) else 0
+
+    # Profit factor = total profit / abs(total loss)
+    total_profit = win_pnl.sum()   if len(win_pnl)  else 0
+    total_loss   = abs(loss_pnl.sum()) if len(loss_pnl) else 0
+    profit_factor = total_profit / total_loss if total_loss > 0 else float("inf")
+
+    # Max drawdown on cumulative PnL series
+    cum = detail_df["累計盈虧(%)"]
+    roll_max = cum.cummax()
+    drawdown = cum - roll_max
+    max_dd   = drawdown.min()
+
+    # Expectancy per trade = WR*avg_win - (1-WR)*avg_loss
+    expectancy = (wr/100) * avg_win + ((1 - wr/100)) * avg_loss
+
+    # Calmar-like: total PnL / abs(max drawdown)
+    calmar = (cum.iloc[-1] / abs(max_dd)) if max_dd != 0 else float("inf")
+
+    max_streak_win  = detail_df["連勝數"].max()
+    max_streak_loss = detail_df["連敗數"].max()
+
+    return {
+        "總交易筆數":      total,
+        "勝出筆數":        int(wins),
+        "敗出筆數":        int(losses),
+        "實際勝率(%)":     round(wr, 1),
+        "平均盈利(%)":     round(avg_win,  2),
+        "平均虧損(%)":     round(avg_loss, 2),
+        "盈虧比":          round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else "∞",
+        "獲利因子":        round(profit_factor, 2) if profit_factor != float("inf") else "∞",
+        "期望值每筆(%)":   round(expectancy, 2),
+        "累計盈虧(%)":     round(float(cum.iloc[-1]), 2),
+        "最大回撤(%)":     round(float(max_dd), 2),
+        "Calmar比率":      round(calmar, 2) if calmar != float("inf") else "∞",
+        "最大連勝":        int(max_streak_win),
+        "最大連敗":        int(max_streak_loss),
+    }
+
+def backtest_signal_combinations(df: "pd.DataFrame", min_combo=2,
+                                  max_combo=4, min_occ=3) -> "pd.DataFrame":
+    """保留舊介面相容：只跑維度1（純信號組合）。回測 Tab 直接呼叫三個子函數。"""
+    return _base_signal_combos(df, min_combo, max_combo, min_occ)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -660,9 +986,10 @@ selected_signals = st.multiselect("選擇需要 Telegram 推播的信號",
 
 # ── Telegram conditions table ─────────────────────────────────────────────────
 st.subheader("📋 Telegram 觸發條件配置（可編輯）")
-default_conds = pd.DataFrame({
-    "排名":     ["1","2","3","4","5"],
-    "異動標記": [
+
+_TG_DEFAULT = pd.DataFrame({
+    "排名":       ["1","2","3","4","5"],
+    "異動標記":   [
         "📈 價格趨勢買入, 📈 持續跳空(上), 📈 SMA50上升趨勢, 📈 OBV突破買入",
         "📈 Low>High, 📈 價格趨勢買入, 📈 SMA50上升趨勢",
         "📈 連續向上買入, 📈 SMA50上升趨勢, 📈 EMA-SMA Uptrend Buy",
@@ -670,18 +997,28 @@ default_conds = pd.DataFrame({
         "📈 EMA買入, 📈 連續向上買入, 📈 SMA50上升趨勢",
     ],
     "成交量標記": ["放量","縮量","放量","放量","縮量"],
-    "K線形態":   ["大陽線","普通K線","大陽線","射擊之星","看漲吞噬"],
+    "K線形態":    ["大陽線","普通K線","大陽線","射擊之星","看漲吞噬"],
+    "回測勝率":   ["N/A","N/A","N/A","N/A","N/A"],
 })
+if "tg_conds" not in st.session_state:
+    st.session_state["tg_conds"] = _TG_DEFAULT.copy()
+
 telegram_conditions = st.data_editor(
-    default_conds, num_rows="dynamic",
+    st.session_state["tg_conds"],
+    num_rows="dynamic",
+    key="tg_editor",
     column_config={
-        "排名":       st.column_config.TextColumn("排名"),
-        "異動標記":   st.column_config.TextColumn("異動標記"),
-        "成交量標記": st.column_config.SelectboxColumn("成交量標記", options=["放量","縮量"]),
-        "K線形態":    st.column_config.TextColumn("K線形態"),
+        "排名":       st.column_config.TextColumn("排名", width="small"),
+        "異動標記":   st.column_config.TextColumn("異動標記", width="large"),
+        "成交量標記": st.column_config.SelectboxColumn("成交量標記",
+                        options=["放量","縮量","—"], width="small"),
+        "K線形態":    st.column_config.TextColumn("K線形態", width="medium"),
+        "回測勝率":   st.column_config.TextColumn("回測勝率", width="small",
+                        help="由回測一鍵加入時自動填入"),
     },
     use_container_width=True,
 )
+st.session_state["tg_conds"] = telegram_conditions
 
 st.title("📊 股票監控儀表板")
 st.caption(f"⏱ 更新時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -971,34 +1308,242 @@ for tab_idx, ticker in enumerate(selected_tickers):
             K_str  = str(data["異動標記"].iloc[-1])
             K_list = [s.strip() for s in K_str.split(", ") if s.strip()]
 
-            # Selected signal push
+            # ── Selected-signal push (user-chosen signals) ────────────────
             for sig in selected_signals:
                 if sig in K_list:
-                    send_telegram_alert(
-                        f"📡 {ticker} 信號「{sig}」"
-                        f" @ ${cur_price:.2f} | RSI={data['RSI'].iloc[-1]:.1f}")
+                    _msg = (
+                        f"📡 信號提醒\n"
+                        f"股票：{ticker} ({selected_interval})\n"
+                        f"信號：{sig}\n"
+                        f"價格：${cur_price:.2f}\n"
+                        f"RSI：{data['RSI'].iloc[-1]:.1f}  MACD：{data['MACD'].iloc[-1]:.3f}\n"
+                        f"成交量：{_fmt_vol(data['Volume'].iloc[-1])}  "
+                        f"({data['成交量標記'].iloc[-1]})"
+                    )
+                    _ok, _err = send_telegram_alert(_msg)
+                    if _ok:
+                        st.toast(f"📡 Telegram 已推送：{sig}", icon="✅")
+                    else:
+                        st.warning(f"⚠️ Telegram 推送失敗（{sig}）：{_err}")
 
-            # FIX: matched_rank initialised to None BEFORE condition checks
-            matched_rank = None
-            for _, cond_row in telegram_conditions.iterrows():
-                req = [s.strip() for s in str(cond_row["異動標記"]).split(", ") if s.strip()]
-                if (all(s in K_list for s in req) and
-                        data["成交量標記"].iloc[-1] == cond_row["成交量標記"] and
-                        data["K線形態"].iloc[-1]  == cond_row["K線形態"]):
-                    matched_rank = cond_row["排名"]
-                    break
+            # ── Condition matching ─────────────────────────────────────────
+            def _safe_str(v) -> str:
+                if v is None:
+                    return ""
+                s = str(v).strip()
+                return "" if s.lower() in ("none", "nan", "nat", "") else s
 
-            if matched_rank is not None:
-                send_telegram_alert(
-                    f"🟢 趨勢反轉買入 {ticker}:{selected_interval} "
-                    f"${cur_price:.2f} | {K_str[:120]} | "
-                    f"{data['成交量標記'].iloc[-1]} | {data['K線形態'].iloc[-1]} | 排名:{matched_rank}")
+            # ── 比對模式切換按鈕 ───────────────────────────────────────────
+            # 預設存在 session_state；每個 ticker 共用同一個 toggle
+            if "tg_match_mode" not in st.session_state:
+                st.session_state["tg_match_mode"] = "first"   # "first" or "all"
 
-            # Breakout/breakdown alerts
+            _col_mode, _col_info = st.columns([1, 4])
+            with _col_mode:
+                _mode_label = (
+                    "🔁 模式：**全部比對**（點擊切換為第一個）"
+                    if st.session_state["tg_match_mode"] == "all"
+                    else "1️⃣ 模式：**第一個匹配**（點擊切換為全部）"
+                )
+                if st.button(_mode_label, key=f"tg_mode_btn_{ticker}"):
+                    st.session_state["tg_match_mode"] = (
+                        "first" if st.session_state["tg_match_mode"] == "all" else "all"
+                    )
+                    st.rerun()
+            with _col_info:
+                if st.session_state["tg_match_mode"] == "all":
+                    st.caption(
+                        "🔁 **全部比對模式**：逐行掃描條件表，"
+                        "每一個符合的條件都各自發一條 Telegram 訊息。"
+                    )
+                else:
+                    st.caption(
+                        "1️⃣ **第一個匹配模式**：從排名第 1 行開始比對，"
+                        "找到第一個符合的條件就觸發並停止，不再往後比對。"
+                    )
+
+            _scan_all  = (st.session_state["tg_match_mode"] == "all")
+            _live_tg   = st.session_state.get("tg_conds", telegram_conditions)
+            _cur_vol   = _safe_str(data["成交量標記"].iloc[-1])
+            _cur_kline = _safe_str(data["K線形態"].iloc[-1])
+
+            # ── 預先計算各指標（發訊息時共用） ────────────────────────────
+            _rsi_val  = float(data["RSI"].iloc[-1])
+            _macd_val = float(data["MACD"].iloc[-1])
+            _sig_line = float(data["Signal_Line"].iloc[-1]) if "Signal_Line" in data.columns else 0.0
+            _vix_val  = data["VIX"].iloc[-1]
+            _vix_str  = f"{_vix_val:.1f}" if pd.notna(_vix_val) else "N/A"
+            _near_str = near_dense_info if near_dense else "無密集區靠近"
+            _dir_icon = "🟢" if px_pct >= 0 else "🔴"
+            _rsi_icon = "🔥" if _rsi_val > 70 else ("🧊" if _rsi_val < 30 else "⚪")
+            _vol_icon = "📈" if _cur_vol == "放量" else "📉"
+
+            def _build_tg_msg(rank: str, backtest_wr: str, match_no: int, total_matches: int) -> str:
+                """組裝單條 Telegram 訊息，match_no/total_matches 用於全部比對模式的序號顯示。"""
+                _header = (
+                    f"{'='*28}\n"
+                    f"🚨 Telegram 觸發條件匹配"
+                    + (f"（第 {match_no}/{total_matches} 條）" if total_matches > 1 else "")
+                    + f"\n{'='*28}"
+                )
+                _lines = [
+                    _header, "",
+                    f"股票代號  : {ticker}",
+                    f"時間框架  : {selected_interval}",
+                    f"觸發時間  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    "",
+                    "--- 價格資訊 ---",
+                    f"現價      : ${cur_price:.2f}  {_dir_icon} {px_pct:+.2f}%",
+                    f"成交量    : {_fmt_vol(data['Volume'].iloc[-1])}  {_vol_icon} {_cur_vol}  ({v_pct:+.1f}%)",
+                    "",
+                    "--- 技術指標 ---",
+                    f"RSI       : {_rsi_val:.1f}  {_rsi_icon}",
+                    f"MACD      : {_macd_val:.4f}  (Signal: {_sig_line:.4f})",
+                    f"K線形態   : {_cur_kline}",
+                    f"VIX       : {_vix_str}",
+                    f"密集區    : {_near_str}",
+                    "",
+                    "--- 觸發信號 ---",
+                ]
+                for _s in K_list[:12]:
+                    _lines.append(f"  {_s}")
+                if len(K_list) > 12:
+                    _lines.append(f"  ... 共 {len(K_list)} 個信號")
+                _lines += [
+                    "",
+                    "--- 匹配條件 ---",
+                    f"條件排名  : #{rank}",
+                    f"回測勝率  : {backtest_wr}",
+                    f"{'='*28}",
+                ]
+                return "\n".join(_lines)
+
+            # ── 核心比對迴圈 ──────────────────────────────────────────────
+            _matched_list = []   # list of (rank, wr, row_idx)
+
+            for _ci, cond_row in _live_tg.iterrows():
+                _raw_marks = _safe_str(cond_row.get("異動標記", ""))
+                if not _raw_marks:
+                    continue
+                req = [s.strip() for s in _raw_marks.split(",") if s.strip()]
+                if not req:
+                    continue
+
+                c_vol   = _safe_str(cond_row.get("成交量標記", ""))
+                c_kline = _safe_str(cond_row.get("K線形態", ""))
+                vol_ok    = (c_vol   == "") or (c_vol   in ("—", "全部")) or (c_vol   == _cur_vol)
+                kline_ok  = (c_kline == "") or (c_kline in ("—", "全部")) or (c_kline == _cur_kline)
+                signals_ok = all(s in K_list for s in req)
+
+                if signals_ok and vol_ok and kline_ok:
+                    _rank_raw = _safe_str(cond_row.get("排名", ""))
+                    _rank     = _rank_raw if _rank_raw else f"#{_ci + 1}"
+                    _wr_raw   = _safe_str(cond_row.get("回測勝率", ""))
+                    _wr       = _wr_raw if _wr_raw else "N/A"
+                    _matched_list.append((_rank, _wr, _ci))
+
+                    if not _scan_all:
+                        break   # 第一個匹配模式：找到就停
+
+            # ── 發送所有匹配訊息 & UI 顯示 ───────────────────────────────
+            _total_matched = len(_matched_list)
+
+            if _total_matched == 0:
+                pass   # 無匹配，靜默
+
+            else:
+                # UI 摘要欄
+                if _total_matched == 1:
+                    _rank0, _wr0, _ = _matched_list[0]
+                    st.info(
+                        f"🎯 **條件匹配！** 排名 {_rank0}，回測勝率 {_wr0}\n\n"
+                        f"信號：{K_str[:120]}\n"
+                        f"成交量：{_cur_vol}  K線：{_cur_kline}",
+                    )
+                else:
+                    _ranks_str = "、".join(r for r, _, __ in _matched_list)
+                    st.info(
+                        f"🎯 **共匹配 {_total_matched} 條條件！** 排名：{_ranks_str}\n\n"
+                        f"信號：{K_str[:120]}\n"
+                        f"成交量：{_cur_vol}  K線：{_cur_kline}",
+                    )
+
+                # 逐一發送每條匹配訊息
+                _send_ok_count  = 0
+                _send_err_msgs  = []
+
+                for _mn, (_rank, _wr, _ci) in enumerate(_matched_list, start=1):
+                    _msg = _build_tg_msg(
+                        rank=_rank, backtest_wr=_wr,
+                        match_no=_mn, total_matches=_total_matched,
+                    )
+                    _ok, _err = send_telegram_alert(_msg)
+                    if _ok:
+                        _send_ok_count += 1
+                        st.toast(
+                            f"✅ {ticker} 條件 #{_rank} 匹配，Telegram 已推送"
+                            + (f"（{_mn}/{_total_matched}）" if _total_matched > 1 else ""),
+                            icon="📨",
+                        )
+                    else:
+                        _send_err_msgs.append(f"排名 {_rank}：{_err}")
+
+                # 統一顯示發送結果
+                if _send_ok_count > 0 and not _send_err_msgs:
+                    st.success(
+                        f"📨 **Telegram 全部發送成功！** "
+                        f"共 {_send_ok_count} 條訊息"
+                        + (f"（排名 {', '.join(r for r,_,__ in _matched_list)}）"
+                           if _total_matched > 1 else
+                           f"（排名 {_matched_list[0][0]}，回測勝率 {_matched_list[0][1]}）"),
+                        icon="✅",
+                    )
+                elif _send_ok_count > 0 and _send_err_msgs:
+                    st.warning(
+                        f"⚠️ 部分發送成功（{_send_ok_count}/{_total_matched}）。\n"
+                        + "\n".join(_send_err_msgs),
+                    )
+                else:
+                    # All failed
+                    if not (BOT_TOKEN and CHAT_ID):
+                        st.warning(
+                            f"⚠️ 條件已匹配（{_total_matched} 條）但 **Telegram 未設定**，訊息未發送。\n\n"
+                            f"請在 `.streamlit/secrets.toml` 中設定 `BOT_TOKEN` 和 `CHAT_ID`。",
+                            icon="⚙️",
+                        )
+                    else:
+                        st.error(
+                            f"❌ **Telegram 全部發送失敗**（已匹配 {_total_matched} 條）：\n"
+                            + "\n".join(_send_err_msgs),
+                            icon="🚨",
+                        )
+
+            # ── Breakout / Breakdown alerts ────────────────────────────────
             if pd.notna(data["High_Max"].iloc[-1]) and data["High"].iloc[-1] >= data["High_Max"].iloc[-1]:
-                send_telegram_alert(f"🚀 {ticker} 破 {W}K 新高 ${data['High'].iloc[-1]:.2f}")
+                _bo_msg = (
+                    f"🚀 突破新高提醒\n"
+                    f"股票：{ticker} ({selected_interval})\n"
+                    f"現價 ${data['High'].iloc[-1]:.2f} 創 {W} 根K線新高\n"
+                    f"成交量：{_fmt_vol(data['Volume'].iloc[-1])}  ({_cur_vol})"
+                )
+                _ok, _err = send_telegram_alert(_bo_msg)
+                if _ok:
+                    st.toast(f"🚀 {ticker} 破 {W}K 新高，Telegram 已推送", icon="🚀")
+                else:
+                    st.warning(f"⚠️ {ticker} 突破新高 Telegram 推送失敗：{_err}")
+
             if pd.notna(data["Low_Min"].iloc[-1]) and data["Low"].iloc[-1] <= data["Low_Min"].iloc[-1]:
-                send_telegram_alert(f"🔻 {ticker} 穿 {W}K 新低 ${data['Low'].iloc[-1]:.2f}")
+                _bd_msg = (
+                    f"🔻 跌破新低提醒\n"
+                    f"股票：{ticker} ({selected_interval})\n"
+                    f"現價 ${data['Low'].iloc[-1]:.2f} 創 {W} 根K線新低\n"
+                    f"成交量：{_fmt_vol(data['Volume'].iloc[-1])}  ({_cur_vol})"
+                )
+                _ok, _err = send_telegram_alert(_bd_msg)
+                if _ok:
+                    st.toast(f"🔻 {ticker} 穿 {W}K 新低，Telegram 已推送", icon="🔻")
+                else:
+                    st.warning(f"⚠️ {ticker} 跌破新低 Telegram 推送失敗：{_err}")
 
             # Email (consolidated)
             sig_dict = {
@@ -1035,33 +1580,157 @@ for tab_idx, ticker in enumerate(selected_tickers):
 # ═════════════════════════════════════════════════════════════════════════════
 
 with tabs[-1]:
-    st.header("🔬 回測：組合信號勝率分析")
-    st.info("""
-    **分析哪些技術指標同時出現時勝率最高**
-    - 做多勝率 = 信號出現後下一根 K 線收漲的比例
-    - 做空勝率 = 信號出現後下一根 K 線收跌的比例
-    - ⚠️ 回測僅供參考，請結合風險管理進行決策
-    """)
+    # ══════════════════════════════════════════════════════════════════════════
+    #  BACKTEST TAB  v2: 3 independent dimensions
+    # ══════════════════════════════════════════════════════════════════════════
+    st.header("🔬 回測：三維信號勝率分析")
 
+    st.info(
+        "**三個維度分開計算，找出歷史勝率最高的組合**\n\n"
+        "| 維度 | 說明 |\n"
+        "|------|------|\n"
+        "| 📊 信號組合 | 多個技術指標同時出現（基礎維度）|\n"
+        "| 📦 信號+成交量 | 信號組合 × 放量/縮量 |\n"
+        "| 🕯️ 信號+K線形態 | 信號組合 × K線形態（大陽線、錘子線…）|\n\n"
+        "三個維度**各自獨立計算**，讓您分別看到量能與K線結構如何提升勝率。\n"
+        "⚠️ 回測僅供參考，請結合風險管理進行決策。"
+    )
+
+    # ── Parameters ────────────────────────────────────────────────────────────
     bt_ticker = st.selectbox("選擇回測股票", selected_tickers, key="bt_ticker")
-    col_a, col_b, col_c = st.columns(3)
-    bt_min = col_a.number_input("最少組合數", 2, 3, int(BT_MIN_COMBO), 1, key="bt_min")
-    bt_max = col_b.number_input("最多組合數", 2, 5, int(BT_MAX_COMBO), 1, key="bt_max")
-    bt_occ = col_c.number_input("最少出現次數", 2, 20, int(BT_MIN_OCC), 1, key="bt_occ")
+
+    # ── yfinance 短週期限制說明 ────────────────────────────────────────────
+    # 1m  : 最近 7 天   → 約  2,730 根（含盤前後）/ 交易時段約 390 根/天
+    # 5m  : 最近 60 天  → 約  2,340 根
+    # 15m : 最近 60 天  → 約    780 根
+    # 30m : 最近 60 天  → 約    390 根
+    # 1h  : 最近 730天  → 約  1,430 根
+    # 1d  : 最多 max    → 約  5,000 根（視股票上市年數）
+    # 1wk : 最多 max    → 約  1,300 根
+    # 1mo : 最多 max    → 約    300 根
+
+    # 每個間隔允許的 period 清單（受 yfinance 限制）
+    _INTERVAL_PERIOD_MAP = {
+        "1m":  {"periods": ["1d","5d","7d"],
+                "default": "7d",
+                "help": "1m 間隔最多只能拉取最近 7 天，約 2,730 根K線"},
+        "5m":  {"periods": ["5d","1mo","60d"],
+                "default": "60d",
+                "help": "5m 間隔最多只能拉取最近 60 天，約 2,340 根K線"},
+        "15m": {"periods": ["5d","1mo","60d"],
+                "default": "60d",
+                "help": "15m 間隔最多只能拉取最近 60 天，約 780 根K線"},
+        "30m": {"periods": ["5d","1mo","60d"],
+                "default": "60d",
+                "help": "30m 間隔最多只能拉取最近 60 天，約 390 根K線"},
+        "1h":  {"periods": ["1mo","3mo","6mo","1y","2y"],
+                "default": "2y",
+                "help": "1h 間隔最多只能拉取最近 730 天，約 1,430 根K線"},
+        "1d":  {"periods": ["3mo","6mo","1y","2y","5y","ytd","max"],
+                "default": "2y",
+                "help": "日線最多可拉取全部歷史，建議 2y 以上"},
+        "1wk": {"periods": ["6mo","1y","2y","5y","ytd","max"],
+                "default": "5y",
+                "help": "週線樣本較少，建議 5y 以上"},
+        "1mo": {"periods": ["1y","2y","5y","ytd","max"],
+                "default": "max",
+                "help": "月線樣本極少，建議 max"},
+    }
+
+    # 所有可選間隔
+    _all_intervals = ["1m","5m","15m","30m","1h","1d","1wk","1mo"]
+
+    st.caption(
+        f"ℹ️ 主監控目前：**{selected_period}** / **{selected_interval}**　"
+        "回測可獨立選擇時間範圍與K線間隔。"
+    )
+
+    _col_i, _col_p = st.columns(2)
+
+    # 先選間隔，再動態更新可用的 period 清單
+    bt_interval = _col_i.selectbox(
+        "回測K線間隔",
+        _all_intervals,
+        index=_all_intervals.index("1d"),
+        key="bt_interval",
+        help="短週期間隔（1m/5m/15m/30m/1h）受 yfinance 限制，可回測天數較少",
+    )
+
+    _period_cfg  = _INTERVAL_PERIOD_MAP.get(bt_interval, _INTERVAL_PERIOD_MAP["1d"])
+    _period_opts = _period_cfg["periods"]
+    _period_def  = _period_cfg["default"]
+    _period_idx  = _period_opts.index(_period_def) if _period_def in _period_opts else 0
+
+    bt_period = _col_p.selectbox(
+        "回測時間範圍",
+        _period_opts,
+        index=_period_idx,
+        key="bt_period",
+        help=_period_cfg["help"],
+    )
+
+    # ── 預估K線數量（含短週期） ────────────────────────────────────────────
+    # 每交易日：1m=390根, 5m=78根, 15m=26根, 30m=13根, 1h=6.5根
+    _BARS_PER_DAY = {"1m":390, "5m":78, "15m":26, "30m":13,
+                     "1h":7,   "1d":1,  "1wk":1,  "1mo":1}
+    _PERIOD_DAYS  = {
+        "1d":1, "5d":5, "7d":7, "60d":60, "1mo":21, "3mo":63,
+        "6mo":126, "1y":252, "2y":504, "5y":1260, "ytd":180, "max":5000,
+    }
+    _days = _PERIOD_DAYS.get(bt_period, 0)
+    _bpd  = _BARS_PER_DAY.get(bt_interval, 1)
+    _est_n = _days * _bpd if _days and _bpd else "?"
+
+    _est_icon = ("🟢" if isinstance(_est_n, int) and _est_n >= 100
+                 else "🟡" if isinstance(_est_n, int) and _est_n >= 30
+                 else "🔴")
+    _est_warn = ""
+    if bt_interval in ("1m","5m","15m","30m"):
+        _est_warn = "　⚠️ 短週期樣本有限，勝率統計建議搭配較低的「最少出現次數」"
+    elif isinstance(_est_n, int) and _est_n < 100:
+        _est_warn = "　（建議 ≥ 100 根，樣本越多勝率越可信）"
+
+    st.caption(
+        f"{_est_icon} 預估約 **{_est_n}** 根K線{_est_warn}"
+    )
+
+    # ── 短週期額外說明 ─────────────────────────────────────────────────────
+    if bt_interval in ("1m","5m","15m","30m","1h"):
+        _help_txt = _period_cfg["help"]
+        st.info(
+            f"📌 {bt_interval} 短週期回測說明\n\n"
+            f"- yfinance 限制：{_help_txt}\n"
+            "- 短週期信號觸發更頻繁，建議將最少出現次數降至 3～5\n"
+            "- 短週期雜訊較多，建議搭配信號+成交量或信號+K線形態維度篩選\n"
+            "- 勝率數據僅反映歷史規律，短週期市場結構變化快，請謹慎使用"
+        )
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    bt_min    = col_a.number_input("最少信號組合數", 2, 3, int(BT_MIN_COMBO), 1, key="bt_min")
+    bt_max    = col_b.number_input("最多信號組合數", 2, 5, int(BT_MAX_COMBO), 1, key="bt_max")
+    bt_occ    = col_c.number_input("最少出現次數",   2, 20, int(BT_MIN_OCC),  1, key="bt_occ")
+    bt_wr_thr = col_d.number_input("高勝率閾值 (%)", 50, 95, 60, 5, key="bt_wr_thr",
+                                    help="高於此值才列入高勝率區，並可一鍵加入 Telegram 條件")
 
     if st.button("🚀 開始回測", type="primary"):
-        with st.spinner(f"正在計算 {bt_ticker} 信號組合勝率..."):
+        with st.spinner(f"正在計算 {bt_ticker}（{bt_period} / {bt_interval}）三維勝率，稍候…"):
             try:
+                # ── Prepare data（使用回測專屬時間範圍，與主監控無關）──────
                 bt_data = yf.Ticker(bt_ticker).history(
-                    period=selected_period, interval=selected_interval).reset_index()
+                    period=bt_period, interval=bt_interval).reset_index()
                 if "Date" in bt_data.columns:
                     bt_data = bt_data.rename(columns={"Date": "Datetime"})
                 bt_data["Datetime"] = pd.to_datetime(bt_data["Datetime"]).dt.tz_localize(None)
-                bt_data["前5均量"]   = bt_data["Volume"].rolling(5).mean()
+                if len(bt_data) < 30:
+                    n_bars = len(bt_data)
+                    st.warning(f"資料不足（{n_bars} 根K線 < 30）。目前：{bt_period} / {bt_interval}，請選更長時間範圍。")
+                    st.stop()
+
+                bt_data["前5均量"]         = bt_data["Volume"].rolling(5).mean()
                 bt_data["Price Change %"]  = bt_data["Close"].pct_change() * 100
                 bt_data["Volume Change %"] = bt_data["Volume"].pct_change() * 100
                 bt_data["MACD"], bt_data["Signal_Line"], _ = calculate_macd(bt_data)
-                bt_data["RSI"]    = calculate_rsi(bt_data)
+                bt_data["RSI"] = calculate_rsi(bt_data)
                 for span, name in [(5,"EMA5"),(10,"EMA10"),(30,"EMA30"),(40,"EMA40")]:
                     bt_data[name] = bt_data["Close"].ewm(span=span, adjust=False).mean()
                 bt_data["SMA50"]  = bt_data["Close"].rolling(50).mean()
@@ -1071,8 +1740,10 @@ with tabs[-1]:
                 bt_data["OBV"]    = calculate_obv(bt_data)
                 bt_data["Up"]   = (bt_data["Close"] > bt_data["Close"].shift(1)).astype(int)
                 bt_data["Down"] = (bt_data["Close"] < bt_data["Close"].shift(1)).astype(int)
-                bt_data["Continuous_Up"]   = bt_data["Up"]   * (bt_data["Up"].groupby(   (bt_data["Up"]   == 0).cumsum()).cumcount() + 1)
-                bt_data["Continuous_Down"] = bt_data["Down"] * (bt_data["Down"].groupby( (bt_data["Down"] == 0).cumsum()).cumcount() + 1)
+                bt_data["Continuous_Up"]   = bt_data["Up"] * (
+                    bt_data["Up"].groupby((bt_data["Up"] == 0).cumsum()).cumcount() + 1)
+                bt_data["Continuous_Down"] = bt_data["Down"] * (
+                    bt_data["Down"].groupby((bt_data["Down"] == 0).cumsum()).cumcount() + 1)
                 W2 = int(MFI_WIN)
                 bt_data["High_Max"]       = bt_data["High"].rolling(W2).max()
                 bt_data["Low_Min"]        = bt_data["Low"].rolling(W2).min()
@@ -1080,75 +1751,440 @@ with tabs[-1]:
                 bt_data["Close_Roll_Min"] = bt_data["Close"].rolling(W2).min()
                 bt_data["MFI_Roll_Max"]   = bt_data["MFI"].rolling(W2).max()
                 bt_data["MFI_Roll_Min"]   = bt_data["MFI"].rolling(W2).min()
-                bt_data["MFI_Bear_Div"]   = (bt_data["Close"] == bt_data["Close_Roll_Max"]) & (bt_data["MFI"] < bt_data["MFI_Roll_Max"].shift(1))
-                bt_data["MFI_Bull_Div"]   = (bt_data["Close"] == bt_data["Close_Roll_Min"]) & (bt_data["MFI"] > bt_data["MFI_Roll_Min"].shift(1))
-                bt_data["OBV_Roll_Max"]   = bt_data["OBV"].rolling(20).max()
-                bt_data["OBV_Roll_Min"]   = bt_data["OBV"].rolling(20).min()
-                bt_data["VIX"] = np.nan; bt_data["VIX_EMA_Fast"] = np.nan; bt_data["VIX_EMA_Slow"] = np.nan
-                bt_data["📈 股價漲跌幅(%)"]   = np.nan
-                bt_data["📊 成交量變動幅(%)"] = np.nan
-                bt_data["Close_N_High"] = np.nan; bt_data["Close_N_Low"] = np.nan
+                bt_data["MFI_Bear_Div"]   = (
+                    (bt_data["Close"] == bt_data["Close_Roll_Max"]) &
+                    (bt_data["MFI"] < bt_data["MFI_Roll_Max"].shift(1)))
+                bt_data["MFI_Bull_Div"]   = (
+                    (bt_data["Close"] == bt_data["Close_Roll_Min"]) &
+                    (bt_data["MFI"] > bt_data["MFI_Roll_Min"].shift(1)))
+                bt_data["OBV_Roll_Max"] = bt_data["OBV"].rolling(20).max()
+                bt_data["OBV_Roll_Min"] = bt_data["OBV"].rolling(20).min()
+                for _nc in ["VIX","VIX_EMA_Fast","VIX_EMA_Slow",
+                             "📈 股價漲跌幅(%)","📊 成交量變動幅(%)",
+                             "Close_N_High","Close_N_Low"]:
+                    bt_data[_nc] = np.nan
 
-                data = bt_data  # needed for closure in compute_all_signals
+                data = bt_data  # closure for compute_all_signals
                 bt_data["異動標記"] = compute_all_signals(bt_data, PARAMS)
 
-                combo_df = backtest_signal_combinations(
-                    bt_data, min_combo=int(bt_min), max_combo=int(bt_max), min_occ=int(bt_occ))
+                # K線形態 & 成交量標記
+                _buster2 = str(round(float(bt_data["Close"].iloc[-1]), 4))
+                kdf2 = get_kline_patterns(bt_ticker, bt_period, bt_interval,
+                                          BODY_RATIO_TH, SHADOW_RATIO_TH, DOJI_BODY_TH, _buster2)
+                kdf2["Datetime"] = pd.to_datetime(kdf2["Datetime"]).dt.tz_localize(None)
+                bt_data = bt_data.merge(kdf2, on="Datetime", how="left")
+                bt_data["K線形態"]  = bt_data["K線形態"].fillna("普通K線")
+                bt_data["成交量標記"] = bt_data.apply(
+                    lambda r: "放量" if pd.notna(r["前5均量"]) and r["Volume"] > r["前5均量"]
+                    else "縮量", axis=1)
 
-                if combo_df.empty:
-                    st.warning("資料不足。請選擇更長的時間範圍（建議 1y 以上）。")
-                else:
-                    total_combos = len(combo_df)
-                    high_wr_df   = combo_df[combo_df["勝率(%)"] >= 60]
-                    st.success(f"✅ 共找到 {total_combos} 個有效組合，其中 {len(high_wr_df)} 個勝率 ≥ 60%")
+                # Save full enriched data for detail validation
+                st.session_state["bt_raw_data"] = bt_data.copy()
 
-                    if not high_wr_df.empty:
-                        st.subheader("🏆 高勝率組合（≥ 60%）")
-                        st.dataframe(
-                            high_wr_df.style.background_gradient(subset=["勝率(%)"], cmap="Greens"),
-                            use_container_width=True)
+                _kw = dict(min_combo=int(bt_min), max_combo=int(bt_max), min_occ=int(bt_occ))
 
-                    st.subheader("📊 全部組合排名")
-                    st.dataframe(
-                        combo_df.style.background_gradient(subset=["勝率(%)"], cmap="RdYlGn"),
-                        use_container_width=True)
+                # ── Run 3 independent dimensions ──────────────────────────
+                df_sig  = _base_signal_combos(bt_data, **_kw)
+                df_vol  = _signal_x_volume_combos(bt_data, **_kw)
+                df_kl   = _signal_x_kline_combos(bt_data, **_kw)
 
-                    # Bar chart
-                    top15 = combo_df.head(15)
-                    bar_colors = ["#2ecc71" if d=="做多" else "#e74c3c" for d in top15["方向"]]
-                    fig_bt = go.Figure(go.Bar(
-                        x=top15["勝率(%)"],
-                        y=top15["信號組合"],
-                        orientation="h",
-                        marker_color=bar_colors,
-                        text=[f"{v:.1f}% ({n}次)" for v,n in zip(top15["勝率(%)"], top15["出現次數"])],
-                        textposition="outside",
-                    ))
-                    fig_bt.add_vline(x=60, line_dash="dash", line_color="gold",
-                                     annotation_text="60% 基準線")
-                    fig_bt.update_layout(
-                        title=f"{bt_ticker} 信號組合勝率排名（前 15）",
-                        xaxis_title="勝率 (%)", height=600,
-                        template="plotly_dark",
-                        margin=dict(l=350, r=80, t=60, b=40),
-                    )
-                    st.plotly_chart(fig_bt, use_container_width=True)
-
-                    # Advice
-                    st.subheader("💡 交易建議")
-                    if not high_wr_df.empty:
-                        best = high_wr_df.iloc[0]
-                        st.success(
-                            f"**最佳組合**：{best['信號組合']}\n\n"
-                            f"- 勝率：**{best['勝率(%)']}%**  |  出現次數：**{best['出現次數']}**  |  方向：**{best['方向']}**\n\n"
-                            "⚠️ 回測基於歷史數據，未來不保證相同表現。請結合基本面分析與嚴格止損策略。")
-                    else:
-                        st.info("目前無 ≥60% 勝率組合，建議延長時間範圍至 1y 以上，或調整信號參數。")
+                st.session_state["bt_df_sig"]      = df_sig
+                st.session_state["bt_df_vol"]      = df_vol
+                st.session_state["bt_df_kl"]       = df_kl
+                st.session_state["_result_wr_thr"]      = int(bt_wr_thr)
+                st.session_state["_result_ticker"]  = bt_ticker
+                st.session_state["_result_period"]  = bt_period
+                st.session_state["_result_interval"]= bt_interval
+                st.session_state["_result_total_bars"]  = len(bt_data)
 
             except Exception as e:
                 st.error(f"回測失敗：{e}")
                 with st.expander("詳細錯誤"):
                     st.code(traceback.format_exc())
+
+    # ── Results (persist via session_state) ───────────────────────────────────
+    if "bt_df_sig" in st.session_state:
+        df_sig  = st.session_state["bt_df_sig"]
+        df_vol  = st.session_state["bt_df_vol"]
+        df_kl   = st.session_state["bt_df_kl"]
+        _wr_thr          = st.session_state.get("_result_wr_thr", 60)
+        _bt_lbl          = st.session_state.get("_result_ticker",   bt_ticker)
+        _bt_period_used  = st.session_state.get("_result_period",   "?")
+        _bt_interval_used= st.session_state.get("_result_interval", "?")
+        _bt_bars_used    = st.session_state.get("_result_total_bars",   "?")
+
+        # Show what data was actually used for this backtest run
+        st.info(
+            f"📊 本次回測使用資料：**{_bt_lbl}**　"
+            f"時間範圍：**{_bt_period_used}**　"
+            f"K線間隔：**{_bt_interval_used}**　"
+            f"共 **{_bt_bars_used}** 根K線"
+            + ("　⚠️ 樣本偏少，勝率僅供參考" if isinstance(_bt_bars_used, int) and _bt_bars_used < 100 else "")
+        )
+
+        # ── Helper: render one dimension result ───────────────────────────
+        def _render_dim(df_dim: pd.DataFrame, title: str, wr_thr: int,
+                        col_order: list, dim_key: str):
+            if df_dim.empty:
+                st.warning(f"{title}：無有效組合，請增加時間範圍或降低最少出現次數。")
+                return
+
+            hi = df_dim[df_dim["勝率(%)"] >= wr_thr].copy()
+            total = len(df_dim)
+            st.success(f"✅ {title}：找到 **{total}** 組，其中 **{len(hi)}** 組勝率 ≥ {wr_thr}%")
+
+            # Summary row
+            m1, m2, m3 = st.columns(3)
+            m1.metric("最高勝率",   f"{df_dim['勝率(%)'].max():.1f}%")
+            m2.metric("平均勝率",   f"{df_dim['勝率(%)'].mean():.1f}%")
+            m3.metric(f"≥{wr_thr}%", len(hi))
+
+            # High win-rate table
+            if not hi.empty:
+                disp_cols = [c for c in col_order if c in hi.columns]
+                st.dataframe(
+                    hi[disp_cols].style.background_gradient(subset=["勝率(%)"], cmap="Greens"),
+                    use_container_width=True,
+                    height=min(400, 38 * (len(hi) + 1) + 40),
+                )
+
+                # ── ONE-CLICK ADD button ───────────────────────────────────
+                btn_label = f"➕ 一鍵加入 {title} 高勝率組合到 Telegram 條件"
+                if st.button(btn_label, key=f"add_{dim_key}", type="primary"):
+                    _one_click_add(hi, dim_key)
+
+            # ── Detail validation & CSV export ────────────────────────────
+            with st.expander(f"🔬 {title} 詳細驗證 & CSV 下載（點擊展開）"):
+                st.caption(
+                    "選擇一個組合，系統逐筆列出每次信號出現後的完整交易記錄，"
+                    "包含進出場價、盈虧%、最大順逆勢，並計算統計摘要驗證勝率準確度。"
+                )
+                # Build combo choices from high-wr rows (or all if hi is empty)
+                _source_df = hi if not hi.empty else df_dim
+                _combo_choices = []
+                for _, _r in _source_df.iterrows():
+                    _lbl = _r["信號組合"]
+                    if _r.get("成交量標記","—") != "—":
+                        _lbl += f"  [{_r['成交量標記']}]"
+                    if _r.get("K線形態","—") != "—":
+                        _lbl += f"  [{_r['K線形態']}]"
+                    _lbl += f"  ({_r['勝率(%)']}%  {_r['出現次數']}次)"
+                    _combo_choices.append(_lbl)
+
+                if not _combo_choices:
+                    st.info("無可選組合，請先完成回測。")
+                else:
+                    _sel = st.selectbox("選擇要驗證的組合", _combo_choices,
+                                        key=f"detail_sel_{dim_key}")
+                    _sel_idx = _combo_choices.index(_sel)
+                    _sel_row = _source_df.iloc[_sel_idx]
+
+                    _hold_bars = st.number_input("持倉根數（幾根K線後出場）",
+                                                  min_value=1, max_value=20, value=1, step=1,
+                                                  key=f"hold_{dim_key}",
+                                                  help="1 = 信號出現後的下一根K線收盤出場")
+
+                    if st.button(f"📊 展開逐筆交易記錄", key=f"detail_btn_{dim_key}"):
+                        _bt_raw = st.session_state.get("bt_raw_data")
+                        if _bt_raw is None:
+                            st.warning("請重新點擊「🚀 開始回測」以載入原始資料。")
+                        else:
+                            with st.spinner("計算中..."):
+                                _detail = _detailed_backtest(
+                                    _bt_raw,
+                                    signal_combo  = _sel_row["信號組合"],
+                                    vol_filter    = _sel_row.get("成交量標記","—"),
+                                    kline_filter  = _sel_row.get("K線形態","—"),
+                                    direction     = _sel_row.get("方向","做多"),
+                                    hold_bars     = int(_hold_bars),
+                                )
+
+                            if _detail.empty:
+                                st.warning("此組合在所選資料中無完整交易記錄（可能樣本不足或出場K線超出範圍）。")
+                            else:
+                                _stats = _summary_stats(_detail)
+
+                                # ── Stats cards ──────────────────────────
+                                st.subheader("📈 統計摘要（驗證勝率準確度）")
+                                _sc = st.columns(4)
+                                _sc[0].metric("實際勝率",
+                                              f"{_stats.get('實際勝率(%)','N/A')}%",
+                                              help="與回測勝率一致即代表計算正確")
+                                _sc[1].metric("期望值/筆",
+                                              f"{_stats.get('期望值每筆(%)','N/A')}%",
+                                              help=">0 代表長期有正期望值")
+                                _sc[2].metric("獲利因子",
+                                              str(_stats.get("獲利因子","N/A")),
+                                              help=">1.5 為優質策略")
+                                _sc[3].metric("最大回撤",
+                                              f"{_stats.get('最大回撤(%)','N/A')}%",
+                                              help="累計盈虧序列的最大跌幅")
+
+                                _sc2 = st.columns(4)
+                                _sc2[0].metric("總筆數",      _stats.get("總交易筆數","N/A"))
+                                _sc2[1].metric("平均盈利/筆", f"{_stats.get('平均盈利(%)','N/A')}%")
+                                _sc2[2].metric("平均虧損/筆", f"{_stats.get('平均虧損(%)','N/A')}%")
+                                _sc2[3].metric("盈虧比",       str(_stats.get("盈虧比","N/A")))
+
+                                _sc3 = st.columns(3)
+                                _sc3[0].metric("累計盈虧",
+                                               f"{_stats.get('累計盈虧(%)','N/A')}%")
+                                _sc3[1].metric("最大連勝",
+                                               _stats.get("最大連勝","N/A"))
+                                _sc3[2].metric("最大連敗",
+                                               _stats.get("最大連敗","N/A"))
+
+                                # ── Cumulative PnL chart ──────────────────
+                                _fig_pnl = go.Figure()
+                                _fig_pnl.add_trace(go.Scatter(
+                                    x=_detail["序號"],
+                                    y=_detail["累計盈虧(%)"],
+                                    mode="lines+markers",
+                                    name="累計盈虧",
+                                    line=dict(color="#2ecc71", width=2),
+                                    fill="tozeroy",
+                                    fillcolor="rgba(46,204,113,0.12)",
+                                ))
+                                _fig_pnl.add_hline(y=0, line_dash="dash",
+                                                   line_color="gray", line_width=0.8)
+                                _fig_pnl.update_layout(
+                                    title="累計盈虧曲線（等額投入模擬）",
+                                    xaxis_title="交易序號",
+                                    yaxis_title="累計盈虧 (%)",
+                                    template="plotly_dark", height=320,
+                                    margin=dict(l=40,r=40,t=50,b=40),
+                                )
+                                st.plotly_chart(_fig_pnl, use_container_width=True,
+                                                key=f"pnl_{dim_key}")
+
+                                # ── Per-trade bar chart ───────────────────
+                                _fig_bar = go.Figure(go.Bar(
+                                    x=_detail["序號"],
+                                    y=_detail["盈虧(%)"],
+                                    marker_color=[
+                                        "#2ecc71" if v >= 0 else "#e74c3c"
+                                        for v in _detail["盈虧(%)"]
+                                    ],
+                                    name="單筆盈虧",
+                                ))
+                                _fig_bar.add_hline(y=0, line_dash="dash",
+                                                   line_color="gray", line_width=0.8)
+                                _fig_bar.update_layout(
+                                    title="逐筆盈虧分佈",
+                                    xaxis_title="交易序號",
+                                    yaxis_title="盈虧 (%)",
+                                    template="plotly_dark", height=280,
+                                    margin=dict(l=40,r=40,t=50,b=40),
+                                )
+                                st.plotly_chart(_fig_bar, use_container_width=True,
+                                                key=f"bar_{dim_key}")
+
+                                # ── Detail table ──────────────────────────
+                                st.subheader("📋 逐筆交易記錄")
+                                _disp_detail = _detail[[
+                                    "序號","進場時間","出場時間","持倉根數",
+                                    "進場價","出場價","方向",
+                                    "盈虧(%)","勝負",
+                                    "最大順勢(%)","最大逆勢(%)",
+                                    "累計盈虧(%)",
+                                    "進場RSI","進場MACD",
+                                    "成交量標記","K線形態",
+                                    "連勝數","連敗數","觸發信號",
+                                ]]
+                                _color_map = {
+                                    True:  "background-color: rgba(46,204,113,0.15)",
+                                    False: "background-color: rgba(231,76,60,0.15)",
+                                }
+                                def _row_color(row):
+                                    is_win = row["勝負"] == "✅ 勝"
+                                    return [_color_map[is_win]] * len(row)
+                                try:
+                                    _styled = _disp_detail.style.apply(_row_color, axis=1)
+                                    st.dataframe(_styled, use_container_width=True,
+                                                 height=min(600, 35*(len(_disp_detail)+1)+40))
+                                except Exception:
+                                    st.dataframe(_disp_detail, use_container_width=True)
+
+                                # ── CSV export ────────────────────────────
+                                _combo_safe = (_sel_row["信號組合"][:40]
+                                               .replace(" + ","_")
+                                               .replace("/","_")
+                                               .replace(" ","_"))
+                                _ticker_safe = st.session_state.get("_result_ticker","stock")
+                                _fname = (f"{_ticker_safe}_{_combo_safe}"
+                                          f"_hold{int(_hold_bars)}"
+                                          f"_{datetime.now().strftime('%Y%m%d')}.csv")
+
+                                # Build full CSV with stats header
+                                _stats_rows = [
+                                    ["=== 統計摘要 ==="],
+                                    ["股票", _ticker_safe],
+                                    ["信號組合", _sel_row["信號組合"]],
+                                    ["成交量篩選", _sel_row.get("成交量標記","—")],
+                                    ["K線形態篩選", _sel_row.get("K線形態","—")],
+                                    ["方向", _sel_row.get("方向","做多")],
+                                    ["持倉根數", int(_hold_bars)],
+                                    ["回測時間範圍", st.session_state.get("_result_period","?")],
+                                    ["K線間隔", st.session_state.get("_result_interval","?")],
+                                    ["總K線根數", st.session_state.get("_result_total_bars","?")],
+                                    [],
+                                ]
+                                for k, v in _stats.items():
+                                    _stats_rows.append([k, v])
+                                _stats_rows.append([])
+                                _stats_rows.append(["=== 逐筆交易記錄 ==="])
+
+                                import io, csv as _csv
+                                _buf = io.StringIO()
+                                _w   = _csv.writer(_buf)
+                                for _srow in _stats_rows:
+                                    _w.writerow(_srow)
+                                _detail.to_csv(_buf, index=False)
+                                _csv_bytes = _buf.getvalue().encode("utf-8-sig")
+
+                                st.download_button(
+                                    label="📥 下載完整逐筆交易 CSV",
+                                    data=_csv_bytes,
+                                    file_name=_fname,
+                                    mime="text/csv",
+                                    type="primary",
+                                )
+                                st.caption(
+                                    f"CSV 包含：統計摘要（{len(_stats)} 項指標）"
+                                    f" + 逐筆記錄（{len(_detail)} 筆）"
+                                )
+
+            # Full table (collapsed)
+            with st.expander(f"📊 {title} 全部 {total} 組（展開查看）"):
+                disp_all = [c for c in col_order if c in df_dim.columns]
+                st.dataframe(
+                    df_dim[disp_all].style.background_gradient(subset=["勝率(%)"], cmap="RdYlGn"),
+                    use_container_width=True, height=420,
+                )
+
+            # Bar chart: top 12
+            top12 = df_dim.head(12).copy()
+            y_labels = []
+            for _, r in top12.iterrows():
+                vol_part   = f" [{r['成交量標記']}]" if r.get("成交量標記","—") != "—" else ""
+                kline_part = f" [{r['K線形態']}]"   if r.get("K線形態","—")   != "—" else ""
+                y_labels.append(r["信號組合"] + vol_part + kline_part)
+            bar_colors = ["#2ecc71" if d=="做多" else "#e74c3c" for d in top12["方向"]]
+            fig_d = go.Figure(go.Bar(
+                x=top12["勝率(%)"], y=y_labels, orientation="h",
+                marker_color=bar_colors,
+                text=[f"{v:.1f}% ({n}次)" for v,n in zip(top12["勝率(%)"],top12["出現次數"])],
+                textposition="outside",
+            ))
+            fig_d.add_vline(x=_wr_thr, line_dash="dash", line_color="gold",
+                            annotation_text=f"{_wr_thr}%")
+            fig_d.update_layout(
+                title=f"{_bt_lbl} — {title}（前12）",
+                xaxis_title="勝率 (%)", xaxis_range=[0, 115],
+                height=520, template="plotly_dark",
+                margin=dict(l=380, r=60, t=50, b=30),
+            )
+            st.plotly_chart(fig_d, use_container_width=True, key=f"chart_{dim_key}")
+
+        # ── One-click add helper (dedup + re-rank) ────────────────────────
+        def _one_click_add(hi_df: pd.DataFrame, dim_key: str):
+            """Append high-WR rows to tg_conds, dedup, re-rank by 勝率."""
+            existing = st.session_state.get("tg_conds", pd.DataFrame()).copy()
+            if "回測勝率" not in existing.columns:
+                existing["回測勝率"] = "N/A"
+
+            new_rows = []
+            for _, row in hi_df.iterrows():
+                vol   = row.get("成交量標記","—")
+                kl    = row.get("K線形態","普通K線")
+                new_rows.append({
+                    "排名":       "",
+                    "異動標記":   row["信號組合"].replace(" + ", ", "),
+                    "成交量標記": "—" if vol == "—" else vol,
+                    "K線形態":    kl,
+                    "回測勝率":   f"{row['勝率(%)']:.1f}%",
+                })
+            new_df = pd.DataFrame(new_rows)
+
+            combined = pd.concat([existing, new_df], ignore_index=True)
+            # Dedup: same 異動標記+成交量標記+K線形態 → keep last (new wins)
+            combined = combined.drop_duplicates(
+                subset=["異動標記","成交量標記","K線形態"], keep="last")
+
+            # Re-rank by 勝率 descending
+            def _parse(v):
+                try:
+                    return float(str(v).replace("%","").strip())
+                except Exception:
+                    return 0.0
+            combined["_n"] = combined["回測勝率"].apply(_parse)
+            combined = combined.sort_values("_n", ascending=False).drop(columns=["_n"])
+            combined = combined.reset_index(drop=True)
+            combined["排名"] = [str(i+1) for i in range(len(combined))]
+
+            st.session_state["tg_conds"] = combined[
+                ["排名","異動標記","成交量標記","K線形態","回測勝率"]]
+
+            added = len(combined) - len(
+                existing.drop_duplicates(subset=["異動標記","成交量標記","K線形態"]))
+            _added_n = max(added, 0)
+            st.success(
+                f"✅ 已追加 **{_added_n}** 條新組合（去重後共 **{len(combined)}** 條）。\n\n"
+                "📋 請捲動至頁面頂部的「**Telegram 觸發條件配置**」表格查看。\n\n"
+                "系統每次刷新時，會自動比對最新一根K線是否符合條件表中的任何一條。\n"
+                "一旦匹配，立即透過 Telegram 發送包含「現價、信號、RSI、MACD、"
+                "K線形態、回測勝率」的完整交易信號。"
+            )
+            if _added_n == 0:
+                st.info("ℹ️ 所有高勝率組合均已存在條件表中（無新增），去重後保留最新版本。")
+
+        # ── Render 3 dimensions in tabs ────────────────────────────────────
+        dim_tab1, dim_tab2, dim_tab3 = st.tabs([
+            "📊 維度一：信號組合",
+            "📦 維度二：信號 + 成交量",
+            "🕯️ 維度三：信號 + K線形態",
+        ])
+
+        COLS_SIG  = ["信號組合","信號數量","勝率(%)","出現次數","方向"]
+        COLS_VOL  = ["信號組合","成交量標記","信號數量","勝率(%)","出現次數","方向"]
+        COLS_KL   = ["信號組合","K線形態","信號數量","勝率(%)","出現次數","方向"]
+
+        with dim_tab1:
+            _render_dim(df_sig,  f"{_bt_lbl} 信號組合", _wr_thr, COLS_SIG, "sig")
+        with dim_tab2:
+            _render_dim(df_vol,  f"{_bt_lbl} 信號+成交量", _wr_thr, COLS_VOL, "vol")
+        with dim_tab3:
+            _render_dim(df_kl,   f"{_bt_lbl} 信號+K線形態", _wr_thr, COLS_KL, "kl")
+
+        # ── Best combo summary across all 3 dims ──────────────────────────
+        st.markdown("---")
+        st.subheader("💡 三維綜合最佳建議")
+        all_hi = []
+        for df_d, lbl in [(df_sig,"信號組合"),(df_vol,"信號+成交量"),(df_kl,"信號+K線形態")]:
+            hi_d = df_d[df_d["勝率(%)"] >= _wr_thr] if not df_d.empty else pd.DataFrame()
+            if not hi_d.empty:
+                best_row = hi_d.iloc[0].copy()
+                best_row["_dim"] = lbl
+                all_hi.append(best_row)
+
+        if all_hi:
+            overall_best = max(all_hi, key=lambda r: r["勝率(%)"])
+            vol_info   = (f"  成交量：**{overall_best.get('成交量標記','—')}**"
+                          if overall_best.get("成交量標記","—") != "—" else "")
+            kline_info = (f"  K線形態：**{overall_best.get('K線形態','—')}**"
+                          if overall_best.get("K線形態","—") != "—" else "")
+            st.success(
+                f"🏆 **全局最佳組合**（來自「{overall_best['_dim']}」維度）\n\n"
+                f"📊 信號：**{overall_best['信號組合']}**\n\n"
+                f"{vol_info}{kline_info}\n\n"
+                f"- 歷史勝率：**{overall_best['勝率(%)']}%**"
+                f"  |  出現次數：**{overall_best['出現次數']}**"
+                f"  |  方向：**{overall_best['方向']}**\n\n"
+                "⚠️ 回測基於歷史數據，未來不保證相同表現。請嚴格執行止損策略。"
+            )
+        else:
+            st.info(f"三個維度均無 ≥ {_wr_thr}% 勝率組合。建議延長時間範圍至 **1y** 以上，"
+                    "或降低高勝率閾值。")
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  AUTO REFRESH (FIX: replace while True + time.sleep with time.sleep + st.rerun)
